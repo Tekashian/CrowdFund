@@ -5,12 +5,12 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol"; // Import Ownable
 
 /**
- * @title Crowdfund Contract (Refactored v4.1 - With Commissions & Default Wallet)
+ * @title Crowdfund Contract (Refactored v4.2 - CEI in donate)
  * @notice Manages crowdfunding campaigns with flexible fund handling and commission mechanisms.
  * Allows creators to initiate closure and provides donors a time window to reclaim funds via pull-payment.
  * @dev Inherits ReentrancyGuard and Ownable. Implements constant pull refunds for donors until finalization.
  * Uses Custom Errors for gas efficiency. Tracks individual donations. Includes commission for startup and charity campaigns.
- * Default commission wallet is hardcoded.
+ * Default commission wallet is hardcoded. Donate function adheres more strictly to CEI.
  */
 contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
 
@@ -205,11 +205,11 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      * @notice Allows any user to donate Ether to an *active* campaign before its *original* deadline.
      * @dev Calculates and transfers commission from the donation amount.
      * Updates current balance (raisedAmount), cumulative total (totalEverRaised), and individual donation tracking.
-     * Sets status to Completed if target is reached. Reentrancy protected.
+     * Sets status to Completed if target is reached. Reentrancy protected. Adheres to CEI pattern.
      * @param _campaignId The ID of the campaign to donate to.
      */
     function donate(uint256 _campaignId) public payable nonReentrant {
-        // Input validation & State checks
+        // --- Checks ---
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
 
@@ -220,30 +220,33 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
 
         // Calculate commission
         uint256 commissionRate = (campaign.campaignType == CampaignType.Startup) ? startupCommissionPercentage : charityCommissionPercentage;
-        uint256 commissionAmount = (msg.value * commissionRate) / 10000; // 10000 because percentage is stored as value * 100 (e.g., 2.00% is 200)
+        uint256 commissionAmount = (msg.value * commissionRate) / 10000;
         uint256 amountToCampaign = msg.value - commissionAmount;
 
-        // Effects
-        campaign.raisedAmount += amountToCampaign; // Only amount after commission goes to campaign balance
-        campaign.totalEverRaised += msg.value; // Track full donation for progress
-        donations[_campaignId][msg.sender] += amountToCampaign; // Track net donation for refund purposes
+        // --- Effects (All state changes before interaction) ---
+        campaign.raisedAmount += amountToCampaign;
+        campaign.totalEverRaised += msg.value;
+        donations[_campaignId][msg.sender] += amountToCampaign;
 
-        emit DonationReceived(_campaignId, msg.sender, msg.value, commissionAmount, block.timestamp);
-
-        // Interaction: Transfer commission
-        if (commissionAmount > 0) {
-            (bool success, ) = commissionWallet.call{value: commissionAmount}("");
-            if (!success) {
-                // If commission transfer fails, revert the donation.
-                // State changes above will be rolled back by the revert.
-                revert CommissionTransferFailed();
-            }
-        }
-
-        // Check if target is reached
+        // Conditionally update status to Completed - this is also an Effect
+        // This check assumes that if we passed the `campaign.status != Status.Active` check above,
+        // the campaign is indeed Active when we reach this point.
         if (campaign.raisedAmount >= campaign.targetAmount && campaign.targetAmount > 0) {
             campaign.status = Status.Completed;
         }
+
+        emit DonationReceived(_campaignId, msg.sender, msg.value, commissionAmount, block.timestamp);
+
+        // --- Interaction ---
+        if (commissionAmount > 0) {
+            (bool success, ) = commissionWallet.call{value: commissionAmount}("");
+            if (!success) {
+                // If commission transfer fails, this revert will undo all state changes made
+                // in this function call (raisedAmount, totalEverRaised, donations mapping, and status if it was changed).
+                revert CommissionTransferFailed();
+            }
+        }
+        // No further state changes after the interaction in the success path.
     }
 
     /**
@@ -254,6 +257,7 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      * @param _campaignId The ID of the campaign to reclaim funds from.
      */
     function claimRefund(uint256 _campaignId) public nonReentrant {
+        // --- Checks ---
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
         Status currentStatus = campaign.status;
@@ -265,26 +269,29 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
             revert ReclaimPeriodOver();
         }
 
-        uint256 netDonationAmount = donations[_campaignId][msg.sender]; // This is the amount AFTER commission
+        uint256 netDonationAmount = donations[_campaignId][msg.sender];
         if (netDonationAmount == 0) revert NoDonationToClaim();
         if (hasReclaimed[_campaignId][msg.sender]) revert AlreadyReclaimed();
 
-        // Effects: Mark as reclaimed, zero donation record, decrease balance
+        // --- Effects ---
         hasReclaimed[_campaignId][msg.sender] = true;
         donations[_campaignId][msg.sender] = 0;
-        campaign.raisedAmount -= netDonationAmount; // Decrease by the net amount
+        campaign.raisedAmount -= netDonationAmount;
 
-        // Interaction: Transfer funds
+        emit RefundClaimed(_campaignId, msg.sender, netDonationAmount); // Emit before interaction is also acceptable for CEI
+
+        // --- Interaction ---
         (bool success, ) = msg.sender.call{value: netDonationAmount}("");
         if (!success) {
             // Revert state changes if transfer fails
+            // The above emit will also be reverted.
             hasReclaimed[_campaignId][msg.sender] = false;
-            donations[_campaignId][msg.sender] = netDonationAmount;
-            campaign.raisedAmount += netDonationAmount;
+            donations[_campaignId][msg.sender] = netDonationAmount; // Restore donation amount
+            campaign.raisedAmount += netDonationAmount; // Restore balance
             revert FundTransferFailed();
         }
-
-        emit RefundClaimed(_campaignId, msg.sender, netDonationAmount);
+        // Note: RefundClaimed event could also be emitted here if preferred, after successful interaction.
+        // Emitting before is fine as long as failure in interaction reverts the whole thing.
     }
 
     /**
@@ -294,6 +301,7 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      * @param _campaignId The ID of the Active campaign to initiate closure for.
      */
     function initiateClosure(uint256 _campaignId) public nonReentrant {
+        // --- Checks ---
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
 
@@ -301,10 +309,12 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
         if (campaign.status == Status.Completed) revert CannotCloseCompletedCampaign();
         if (campaign.status != Status.Active) revert CampaignNotActive();
 
+        // --- Effects ---
         campaign.status = Status.Closing;
         campaign.reclaimDeadline = block.timestamp + RECLAIM_PERIOD;
 
         emit CampaignClosingInitiated(_campaignId, msg.sender, campaign.reclaimDeadline);
+        // No interaction in this function
     }
 
     /**
@@ -315,6 +325,7 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      * @param _campaignId The ID of the campaign in the Closing state.
      */
     function finalizeClosureAndWithdraw(uint256 _campaignId) public nonReentrant {
+        // --- Checks ---
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
 
@@ -322,23 +333,25 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
         if (campaign.status != Status.Closing) revert CampaignNotClosing();
         if (block.timestamp < campaign.reclaimDeadline) revert ReclaimPeriodActive();
 
-        uint256 amountToWithdraw = campaign.raisedAmount; // This is the net amount after commissions and any refunds
+        uint256 amountToWithdraw = campaign.raisedAmount;
 
-        // Effects before interaction
+        // --- Effects (before interaction) ---
         campaign.raisedAmount = 0;
         campaign.status = Status.ClosedByCreator;
 
-        // Interaction
+        emit CampaignClosedByCreator(_campaignId, msg.sender, amountToWithdraw, 0); // Emit before interaction
+
+        // --- Interaction ---
         if (amountToWithdraw > 0) {
             (bool success, ) = msg.sender.call{value: amountToWithdraw}("");
             if (!success) {
+                // Revert state changes
                 campaign.raisedAmount = amountToWithdraw;
                 campaign.status = Status.Closing;
+                // Event CampaignClosedByCreator also gets reverted.
                 revert FundTransferFailed();
             }
         }
-        // No commission to deduct here, as it was taken per donation.
-        emit CampaignClosedByCreator(_campaignId, msg.sender, amountToWithdraw, 0);
     }
 
     /**
@@ -348,29 +361,32 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      * @param _campaignId The ID of the completed campaign.
      */
     function withdrawFunds(uint256 _campaignId) public nonReentrant {
+        // --- Checks ---
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
 
         if (msg.sender != campaign.creator) revert NotCampaignCreator();
         if (campaign.status != Status.Completed) revert CampaignNotCompleted();
 
-        uint256 amountToWithdraw = campaign.raisedAmount; // This is the net amount after commissions
+        uint256 amountToWithdraw = campaign.raisedAmount;
 
-        // Effects before interaction
+        // --- Effects (before interaction) ---
         campaign.raisedAmount = 0;
         campaign.status = Status.Withdrawn;
 
-        // Interaction
-        if (amountToWithdraw > 0) { // Target reached, so raisedAmount (net) should be > 0
+        emit FundsWithdrawn(_campaignId, msg.sender, amountToWithdraw, 0); // Emit before interaction
+
+        // --- Interaction ---
+        if (amountToWithdraw > 0) {
             (bool success, ) = msg.sender.call{value: amountToWithdraw}("");
             if (!success) {
+                // Revert state changes
                 campaign.raisedAmount = amountToWithdraw;
                 campaign.status = Status.Completed;
+                // Event FundsWithdrawn also gets reverted.
                 revert FundTransferFailed();
             }
         }
-        // No commission to deduct here, as it was taken per donation.
-        emit FundsWithdrawn(_campaignId, msg.sender, amountToWithdraw, 0);
     }
 
     // --- Commission Management Functions (Owner Only) ---
@@ -441,7 +457,6 @@ contract Crowdfund is ReentrancyGuard, Ownable { // Inherit Ownable
      */
     function getDonationAmount(uint256 _campaignId, address _donor) external view returns (uint256) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) revert InvalidCampaignId();
-        // No need to check campaign existence here as mapping defaults to 0 if donor/campaign invalid
         return donations[_campaignId][_donor];
     }
 }
