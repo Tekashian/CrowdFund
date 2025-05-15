@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.30;
 
 import "./Crowdfund.sol"; // Upewnij się, że ta ścieżka jest poprawna
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";

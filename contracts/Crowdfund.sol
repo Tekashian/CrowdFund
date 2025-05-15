@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol"; // OZ v5.x
@@ -7,11 +7,12 @@ import "@openzeppelin/contracts/access/Ownable.sol";          // OZ v5.x
 import "@openzeppelin/contracts/utils/Pausable.sol";       // OZ v5.x
 
 /**
- * @title Crowdfund Contract (Refactored v5.5.1 - Comprehensive NatSpec, Fair Failed Refunds, Advanced Commissions)
+ * @title Crowdfund Contract (Refactored v5.5.2 - Streamlined Reverts, Comprehensive NatSpec, Fair Failed Refunds, Advanced Commissions)
  * @author [Twoje Imię/Nazwa Firmy/Pseudonim Developera]
  * @notice This contract facilitates ERC20-based crowdfunding campaigns, offering distinct commission structures
  * for donations, successful campaign withdrawals, and (optionally) donor-initiated refunds.
  * It prioritizes donor security by waiving refund commissions for campaigns that do not meet their funding goals.
+ * Revert paths have been streamlined relying on Solidity's atomicity for state rollback.
  * @dev Inherits ReentrancyGuard for security against reentrancy attacks, Ownable for access control,
  * and Pausable for emergency stop functionality (all from OpenZeppelin Contracts v5.x).
  * The contract is designed for gas efficiency using custom errors and optimized state management.
@@ -201,7 +202,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     /** @dev Emitted when an ERC20 token is removed from the whitelist by the owner. */
     event TokenRemovedFromWhitelist(address indexed tokenAddress);
     // Note: The inherited Pausable contract from OpenZeppelin v5.x emits its own Paused(address account)
-    // and Unpaused(address account) events when pause() or unpause() are called by the owner.
+    // and Unpaused(address account) events when _pause() or _unpause() are called by the owner functions.
 
     // --- Custom Errors ---
     // These custom errors are used to provide more specific reasons for transaction failures, saving gas compared to string messages.
@@ -428,7 +429,6 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         campaign.endTime = _endTime;
         campaign.status = Status.Active;
         campaign.creationTimestamp = block.timestamp;
-        // raisedAmount, totalEverRaised, reclaimDeadline default to 0
 
         emit CampaignCreated(
             campaignId, msg.sender, _acceptedTokenAddress, _campaignType, _targetAmount, _dataCID, _endTime, block.timestamp
@@ -445,13 +445,13 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     function donate(uint256 _campaignId, uint256 _donationAmount) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
-        IERC20 token = campaign.acceptedToken; // Already an IERC20 type
+        IERC20 token = campaign.acceptedToken;
 
-        if (address(token) == address(0)) revert InvalidTokenAddress(); // Should not happen if campaign creation is correct
+        if (address(token) == address(0)) revert InvalidTokenAddress();
         if (campaign.status != Status.Active) revert CampaignNotActive();
         if (block.timestamp >= campaign.endTime) revert CampaignHasEnded();
         if (_donationAmount == 0) revert DonationAmountMustBePositive();
-        if (commissionWallet == address(0)) revert CommissionWalletNotSet(); // Ensure commission wallet is still set
+        if (commissionWallet == address(0)) revert CommissionWalletNotSet();
 
         uint256 currentAllowance = token.allowance(msg.sender, address(this));
         if (currentAllowance < _donationAmount) {
@@ -467,12 +467,11 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         // --- Effects ---
         campaign.raisedAmount += amountToCampaign;
         campaign.totalEverRaised += _donationAmount;
-        donations[_campaignId][msg.sender] += amountToCampaign; // Track net contribution from this donor
+        donations[_campaignId][msg.sender] += amountToCampaign;
 
         if (campaign.raisedAmount >= campaign.targetAmount && campaign.targetAmount > 0) {
             campaign.status = Status.Completed;
         }
-
         emit DonationReceived(
             _campaignId, msg.sender, address(token), _donationAmount, amountToCampaign, actualDonationCommission, block.timestamp
         );
@@ -483,7 +482,6 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
         if (actualDonationCommission > 0) {
             success = token.transfer(commissionWallet, actualDonationCommission);
-            // If this transfer fails, the whole transaction reverts, including the donor's transferFrom.
             if (!success) revert TokenTransferFailed(address(token), commissionWallet, actualDonationCommission);
         }
     }
@@ -491,7 +489,9 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     /**
      * @notice Allows a donor to reclaim their net contributed funds from a campaign.
      * @dev Applicable if campaign is 'Active', 'Closing' (within `reclaimDeadline`), or 'Failed'.
-     * A refund commission may be charged, except if the campaign status is 'Failed'. Reentrancy guarded.
+     * A refund commission may be charged (based on `refundCommissionPercentage`),
+     * except if the campaign status is 'Failed', in which case no refund commission is applied.
+     * Reentrancy guarded.
      * @param _campaignId The ID of the campaign.
      */
     function claimRefund(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
@@ -514,45 +514,37 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 actualRefundCommission = 0;
         uint256 amountToReturnToDonor = netDonationByDonor;
 
-        // Only apply refund commission if the campaign is NOT Failed and a commission rate is set.
+        // Apply refund commission only if the campaign is NOT Failed and a commission rate is set.
         if (currentStatus != Status.Failed && refundCommissionPercentage > 0) {
             actualRefundCommission = (netDonationByDonor * refundCommissionPercentage) / 10000;
-            if (actualRefundCommission > netDonationByDonor) { // Safety check, should not happen with percentage <= 10000
-                revert RefundAmountExceedsDonation();
+            if (actualRefundCommission > netDonationByDonor) { 
+                revert RefundAmountExceedsDonation(); // Should not happen with percentage <= 10000
             }
             amountToReturnToDonor = netDonationByDonor - actualRefundCommission;
         }
 
         // --- Effects ---
         hasReclaimed[_campaignId][msg.sender] = true;
-        donations[_campaignId][msg.sender] = 0; // Zero out donor's tracked contribution
-        // The campaign's effective raised amount decreases by the full netDonationByDonor,
-        // as this amount is no longer available to the campaign's purpose.
-        campaign.raisedAmount -= netDonationByDonor;
+        donations[_campaignId][msg.sender] = 0;
+        campaign.raisedAmount -= netDonationByDonor; // Full netDonationByDonor is removed from campaign's pool
 
-        // If a refund (theoretically from a state that allowed it like Admin intervention)
-        // causes a 'Completed' campaign to drop below target, revert its status to 'Active'.
-        // This is a safeguard, primary status checks should prevent this path for standard user actions.
         if (campaign.status == Status.Completed && campaign.raisedAmount < campaign.targetAmount) {
             campaign.status = Status.Active;
         }
-
         emit RefundClaimed(_campaignId, msg.sender, address(token), amountToReturnToDonor, actualRefundCommission);
 
         // --- Interactions ---
-        // Order of transfers: commission first, then donor. If any fails, all state changes revert.
         if (actualRefundCommission > 0) {
             bool commissionSuccess = token.transfer(commissionWallet, actualRefundCommission);
             if (!commissionSuccess) {
-                // Revert all prior state changes by reverting the transaction.
+                // Revert will automatically undo state changes made above in this function call.
                 revert TokenTransferFailed(address(token), commissionWallet, actualRefundCommission);
             }
         }
-
         if (amountToReturnToDonor > 0) {
             bool donorSuccess = token.transfer(msg.sender, amountToReturnToDonor);
             if (!donorSuccess) {
-                // Revert all prior state changes, including the commission transfer if it happened.
+                // Revert will automatically undo state changes, including the commission transfer if it occurred.
                 revert TokenTransferFailed(address(token), msg.sender, amountToReturnToDonor);
             }
         }
@@ -569,7 +561,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
         if (msg.sender != campaign.creator) revert NotCampaignCreator();
         if (campaign.status == Status.Completed) revert CannotCloseCompletedCampaign();
-        if (campaign.status == Status.Failed) revert CannotCloseFailedCampaign(); // Cannot close an already failed one
+        if (campaign.status == Status.Failed) revert CannotCloseFailedCampaign();
         if (campaign.status != Status.Active) revert CampaignNotActive();
 
         campaign.status = Status.Closing;
@@ -580,7 +572,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     /**
      * @notice Allows the campaign creator to withdraw remaining funds from a 'Closing' campaign
      * after the `RECLAIM_PERIOD` has ended.
-     * @dev No success commission is applied here by default.
+     * @dev No success commission is applied in this scenario by default.
      * @param _campaignId The ID of the 'Closing' campaign.
      */
     function finalizeClosureAndWithdraw(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
@@ -603,9 +595,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         if (amountToWithdraw > 0) {
             bool success = token.transfer(campaign.creator, amountToWithdraw);
             if (!success) {
-                // Revert state changes
-                campaign.raisedAmount = amountToWithdraw;
-                campaign.status = Status.Closing;
+                // Revert will automatically undo state changes made above.
                 revert TokenTransferFailed(address(token), campaign.creator, amountToWithdraw);
             }
         }
@@ -634,8 +624,8 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
         if (successCommRate > 0) {
             actualSuccessCommission = (amountAvailableForWithdrawal * successCommRate) / 10000;
-            if (actualSuccessCommission > amountAvailableForWithdrawal) { // Safety cap
-                actualSuccessCommission = amountAvailableForWithdrawal;
+            if (actualSuccessCommission > amountAvailableForWithdrawal) {
+                actualSuccessCommission = amountAvailableForWithdrawal; // Cap commission
             }
             amountToCreator = amountAvailableForWithdrawal - actualSuccessCommission;
         }
@@ -646,22 +636,17 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         emit FundsWithdrawn(_campaignId, msg.sender, address(token), amountToCreator, actualSuccessCommission);
 
         // --- Interactions ---
-        // Order: commission, then creator. Failure in any transfer reverts all state changes.
         if (actualSuccessCommission > 0) {
             bool commissionSuccess = token.transfer(commissionWallet, actualSuccessCommission);
             if (!commissionSuccess) {
-                campaign.raisedAmount = amountAvailableForWithdrawal;
-                campaign.status = Status.Completed;
+                // Revert will automatically undo state changes made above.
                 revert TokenTransferFailed(address(token), commissionWallet, actualSuccessCommission);
             }
         }
-
         if (amountToCreator > 0) {
             bool creatorSuccess = token.transfer(campaign.creator, amountToCreator);
             if (!creatorSuccess) {
-                // If commission was sent, this full revert will "pull it back".
-                campaign.raisedAmount = amountAvailableForWithdrawal;
-                campaign.status = Status.Completed;
+                // Revert will automatically undo state changes, including potential commission transfer.
                 revert TokenTransferFailed(address(token), campaign.creator, amountToCreator);
             }
         }
@@ -678,32 +663,19 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         Campaign storage campaign = campaigns[_campaignId];
 
         if (campaign.status != Status.Active) revert CampaignNotActive();
-        if (block.timestamp < campaign.endTime) revert CampaignHasEnded(); // Or a more specific "CampaignNotYetEnded"
-        // If targetAmount is 0, it's considered met by default if any funds raised (or not, depending on definition).
-        // Here, if target is 0, it cannot "fail" by not meeting target, unless it also has 0 raised.
-        // The condition implies that if targetAmount > 0, it must not be met.
+        if (block.timestamp < campaign.endTime) revert CampaignHasEnded(); // Consider "CampaignNotYetEnded" for clarity
         if (campaign.targetAmount > 0 && campaign.raisedAmount >= campaign.targetAmount) {
             revert("CampaignTargetMetCannotFail");
         }
-        // If targetAmount is 0, it should arguably transition to Completed if endTime is reached,
-        // or this function might need adjustment. Current logic: allows failing if target is 0 and endTime passed.
-
         campaign.status = Status.Failed;
         emit CampaignFailedAndClosed(_campaignId, campaign.endTime);
     }
 
     // --- Pausable Control (Owner Only) ---
-    /** @notice Pauses the contract, restricting major state-changing operations. Called by owner. */
-    function pauseContract() public onlyOwner {
-        _pause(); // Calls internal _pause() from Pausable.sol
-                  // Pausable.sol (v5.x) emits Paused(msg.sender)
-    }
-
-    /** @notice Unpauses the contract, resuming normal operations. Called by owner. */
-    function unpauseContract() public onlyOwner {
-        _unpause(); // Calls internal _unpause() from Pausable.sol
-                    // Pausable.sol (v5.x) emits Unpaused(msg.sender)
-    }
+    /** @notice Pauses the contract, restricting major state-changing operations. */
+    function pauseContract() public onlyOwner { _pause(); }
+    /** @notice Unpauses the contract, resuming normal operations. */
+    function unpauseContract() public onlyOwner { _unpause(); }
 
     // --- View Functions ---
     /**
@@ -711,56 +683,43 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
      * @param _campaignId The ID of the campaign to query.
      * @return campaignData A {@link Campaign} struct containing the campaign's information.
      */
-    function getCampaignDetails(uint256 _campaignId)
-        external view returns (Campaign memory campaignData) {
+    function getCampaignDetails(uint256 _campaignId) public view returns (Campaign memory campaignData) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) {
              revert InvalidCampaignId();
         }
         return campaigns[_campaignId];
     }
-
     /**
      * @notice Retrieves the creator's address for a specific campaign.
      * @param _campaignId The ID of the campaign.
      * @return creatorAddress The Ethereum address of the campaign's creator.
      */
-    function getCampaignCreator(uint256 _campaignId) external view returns (address creatorAddress) {
+    function getCampaignCreator(uint256 _campaignId) public view returns (address creatorAddress) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) {
             revert InvalidCampaignId();
         }
         return campaigns[_campaignId].creator;
     }
-
     /**
-     * @notice Retrieves the net amount a specific donor has contributed to a campaign
-     * (after initial donation commission, before any refunds).
+     * @notice Retrieves the net amount a specific donor has contributed to a campaign.
      * @param _campaignId The ID of the campaign.
      * @param _donor The address of the donor.
-     * @return The net amount donated by the `_donor` to campaign `_campaignId`.
+     * @return The net amount donated (after initial donation commission).
      */
-    function getDonationAmountForDonor(uint256 _campaignId, address _donor) external view returns (uint256) {
-        // No need to check for campaign existence here as mapping will return 0 for non-existent entries.
-        // However, for consistency with other getters, a check could be added.
+    function getDonationAmountForDonor(uint256 _campaignId, address _donor) public view returns (uint256) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) {
-            revert InvalidCampaignId(); // Or simply return 0 if preferred for non-existent campaign IDs
+            // If campaignId is potentially 0 or out of current range, but might exist in future if nextCampaignId wraps (highly unlikely)
+            // A check for campaigns[_campaignId].creationTimestamp > 0 would be more robust if allowing non-sequential IDs
+            revert InvalidCampaignId();
         }
         return donations[_campaignId][_donor];
     }
-
-    /**
-     * @notice Retrieves the list of all whitelisted ERC20 token addresses that can be used for campaigns.
-     * @return An array of addresses.
-     */
-    function getWhitelistedTokens() external view returns (address[] memory) {
+    /** @notice Retrieves the list of all whitelisted ERC20 token addresses. */
+    function getWhitelistedTokens() public view returns (address[] memory) {
         return whitelistedTokens;
     }
-
-    /**
-     * @notice Checks if a given ERC20 token address is currently whitelisted for use in campaigns.
-     * @param _tokenAddress The address of the ERC20 token to check.
-     * @return True if the token is whitelisted, false otherwise.
-     */
-    function checkIsTokenWhitelisted(address _tokenAddress) external view returns (bool) {
+    /** @notice Checks if a given ERC20 token address is currently whitelisted. */
+    function checkIsTokenWhitelisted(address _tokenAddress) public view returns (bool) {
         return isTokenWhitelisted[_tokenAddress];
     }
 }

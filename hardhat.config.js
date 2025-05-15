@@ -19,7 +19,7 @@ const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || ""; // Klucz API BSCScan 
 module.exports = {
   // --- SEKCJA SOLIDITY Z WŁĄCZONYM OPTYMALIZATOREM ---
   solidity: {
-    version: "0.8.20", // Wersja Solidity spójna z kontraktami
+    version: "0.8.30", // Wersja Solidity spójna z kontraktami
     settings: {
       optimizer: {
         enabled: true, // Włącz optymalizator kompilatora Solidity

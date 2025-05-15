@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol"; // Dla funkcji mint dostępnej tylko dla właściciela
 
 // Prosty mockowy kontrakt ERC20 do celów testowych
 contract MockERC20 is ERC20, Ownable {
-    uint8 private _decimals;
+    uint8 private immutable _decimals;
 
     constructor(
         string memory name,
