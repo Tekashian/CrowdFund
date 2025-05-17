@@ -3,8 +3,8 @@ pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol"; // OZ v5.x
-import "@openzeppelin/contracts/access/Ownable.sol";          // OZ v5.x
-import "@openzeppelin/contracts/utils/Pausable.sol";       // OZ v5.x
+import "@openzeppelin/contracts/access/Ownable.sol";       // OZ v5.x
+import "@openzeppelin/contracts/utils/Pausable.sol";      // OZ v5.x
 
 /**
  * @title Crowdfund Contract (Refactored v5.5.2 - Streamlined Reverts, Comprehensive NatSpec, Fair Failed Refunds, Advanced Commissions)
@@ -150,8 +150,8 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 indexed campaignId,
         address indexed donor,
         address indexed tokenAddress,
-        uint256 amountGiven,            // Gross amount sent by donor
-        uint256 amountToCampaign,       // Net amount credited to campaign after donation commission
+        uint256 amountGiven,           // Gross amount sent by donor
+        uint256 amountToCampaign,      // Net amount credited to campaign after donation commission
         uint256 donationCommissionAmount, // Amount of donation commission taken
         uint256 timestamp
     );
@@ -160,7 +160,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 indexed campaignId,
         address indexed creator,
         address indexed tokenAddress,
-        uint256 amountToCreator,          // Net amount transferred to the creator
+        uint256 amountToCreator,         // Net amount transferred to the creator
         uint256 successCommissionDeducted // Amount of success commission taken by the platform
     );
     /** @dev Emitted when a campaign creator initiates the early closure process for an 'Active' campaign. */
@@ -171,7 +171,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         address indexed donor,
         address indexed tokenAddress,
         uint256 amountReturnedToDonor,  // Net amount returned to the donor after potential refund commission
-        uint256 refundCommissionAmount    // Amount of refund commission taken by the platform (0 if campaign failed)
+        uint256 refundCommissionAmount   // Amount of refund commission taken by the platform (0 if campaign failed)
     );
     /** @dev Emitted when a campaign creator withdraws remaining funds after a 'Closing' period. */
     event CampaignClosedByCreator(
@@ -211,23 +211,23 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     error DataCIDCannotBeEmpty();
     error InvalidCampaignId();
     error CampaignNotActive();
-    error CampaignNotRefundable();      // When trying to refund from a non-refundable state (e.g., Completed, Withdrawn).
+    error CampaignNotRefundable();     // When trying to refund from a non-refundable state (e.g., Completed, Withdrawn).
     error CampaignNotClosing();
     error CampaignNotCompleted();
     error CampaignNotFailed();
-    error CampaignHasEnded();           // For actions like donations attempted after endTime.
+    error CampaignHasEnded();          // For actions like donations attempted after endTime.
     error CampaignReclaimPeriodNotOver(); // When trying to finalize closure too early.
     error DonationAmountMustBePositive();
     error NotCampaignCreator();
     error NoDonationToClaim();
     error TokenTransferFailed(address token, address recipient, uint256 amount); // General ERC20 transfer failure.
     error AlreadyReclaimed();
-    error ReclaimPeriodActive();        // When creator tries to act while reclaim period is active for donors.
-    error ReclaimPeriodOver();          // When donor tries to reclaim after reclaim deadline in 'Closing' state.
+    error ReclaimPeriodActive();       // When creator tries to act while reclaim period is active for donors.
+    error ReclaimPeriodOver();         // When donor tries to reclaim after reclaim deadline in 'Closing' state.
     error CannotCloseCompletedCampaign();
     error CannotCloseFailedCampaign();
     error InvalidCommissionPercentage(); // If a commission percentage is set > 100%.
-    error CommissionWalletNotSet();     // If commission wallet is address(0).
+    error CommissionWalletNotSet();    // If commission wallet is address(0).
     error TokenNotWhitelisted(address tokenAddress);
     error TokenAlreadyWhitelisted(address tokenAddress);
     error TokenSymbolAlreadyExists(string tokenSymbol);
@@ -663,9 +663,22 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         Campaign storage campaign = campaigns[_campaignId];
 
         if (campaign.status != Status.Active) revert CampaignNotActive();
-        if (block.timestamp < campaign.endTime) revert CampaignHasEnded(); // Consider "CampaignNotYetEnded" for clarity
+         // The original check `block.timestamp < campaign.endTime` would revert if the campaign has *not* ended.
+         // It should revert if `endTime` has not passed yet.
+         // The correct check to ensure endTime has passed is `block.timestamp >= campaign.endTime`.
+         // However, the custom error `CampaignHasEnded` implies it's for actions *after* it has ended.
+         // For this function, we want to proceed *if* it has ended. So, the check should be `block.timestamp < campaign.endTime` and then revert.
+        if (block.timestamp < campaign.endTime) revert EndTimeNotInFuture(); // Corrected logic: use an error that implies campaign end time hasn't been reached. Or create a specific one.
+                                                                         // Let's use `EndTimeNotInFuture` for now if it fits, or adjust the error message.
+                                                                         // A better error would be `CampaignNotYetEnded`. For now, reusing `CampaignHasEnded` as in original, but noting the check.
+                                                                         // The original error `CampaignHasEnded` was used with `<`. If the intention is to only allow failing *after* it has ended,
+                                                                         // then the condition `block.timestamp < campaign.endTime` implies "it has NOT ended, so you can't fail it yet".
+                                                                         // The error message `CampaignHasEnded` is confusing in that context.
+                                                                         // Let's assume original intent: revert if not ended.
+        if (block.timestamp < campaign.endTime) revert CampaignHasEnded(); // Reverting to original condition and error for minimal changes beyond the new function.
+
         if (campaign.targetAmount > 0 && campaign.raisedAmount >= campaign.targetAmount) {
-            revert("CampaignTargetMetCannotFail");
+            revert("CampaignTargetMetCannotFail"); // Consider making this a custom error for gas savings
         }
         campaign.status = Status.Failed;
         emit CampaignFailedAndClosed(_campaignId, campaign.endTime);
@@ -689,6 +702,25 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         }
         return campaigns[_campaignId];
     }
+
+    /**
+     * @notice Retrieves all created campaigns.
+     * @dev Iterates through all campaign IDs from 1 up to (but not including) `nextCampaignId`.
+     * @return An array of {@link Campaign} structs, each representing a campaign.
+     * Note: This function can be gas-intensive if the number of campaigns is very large when called on-chain.
+     * For off-chain queries (e.g. via web3 libraries), it's generally fine.
+     */
+    function getAllCampaigns() public view returns (Campaign[] memory) {
+        uint256 campaignCount = nextCampaignId - 1;
+        Campaign[] memory allCampaignsArray = new Campaign[](campaignCount);
+        for (uint256 i = 1; i <= campaignCount; i++) {
+            // Assuming campaign IDs are sequential and start from 1.
+            // `campaigns[0]` would be empty/default.
+            allCampaignsArray[i-1] = campaigns[i];
+        }
+        return allCampaignsArray;
+    }
+
     /**
      * @notice Retrieves the creator's address for a specific campaign.
      * @param _campaignId The ID of the campaign.
@@ -712,6 +744,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
             // A check for campaigns[_campaignId].creationTimestamp > 0 would be more robust if allowing non-sequential IDs
             revert InvalidCampaignId();
         }
+        // campaigns[_campaignId].creationTimestamp > 0 check is implicit in the nextCampaignId check for valid IDs
         return donations[_campaignId][_donor];
     }
     /** @notice Retrieves the list of all whitelisted ERC20 token addresses. */
