@@ -304,6 +304,9 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         campaign.totalEverRaised += _donationAmount;
         donations[_campaignId][msg.sender] += amountToCampaign;
 
+        // --- FIX: Reset hasReclaimed przy nowej wpłacie
+        hasReclaimed[_campaignId][msg.sender] = false;
+
         if (campaign.raisedAmount >= campaign.targetAmount && campaign.targetAmount > 0) {
             campaign.status = Status.Completed;
         }

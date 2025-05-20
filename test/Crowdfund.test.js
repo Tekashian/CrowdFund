@@ -121,6 +121,66 @@ describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)"
         return await crowdfund.getCampaignDetails(campaignId);
     }
 
+    // --- TESTY EDGE-CASE --- //
+    describe("Donations and repeated refunds (flag edge-case)", function () {
+        let campaignId;
+        beforeEach(async function() {
+            const campaignDetails = await createActiveCampaign(CampaignType.Startup);
+            campaignId = campaignDetails.campaignId;
+        });
+
+        it("Donor can donate, claimRefund, donate again, claimRefund again (flag resets)", async function () {
+            // First donation
+            const amount1 = smallDonationTokens;
+            const comm1 = (amount1 * initialStartupDonationCommPerc) / 10000n;
+            const net1 = amount1 - comm1;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, amount1);
+            await crowdfund.connect(donor1).donate(campaignId, amount1);
+
+            // Refund 1
+            const refundComm1 = (net1 * initialRefundCommPerc) / 10000n;
+            const amountToDonor1 = net1 - refundComm1;
+            await expect(crowdfund.connect(donor1).claimRefund(campaignId))
+                .to.emit(crowdfund, "RefundClaimed")
+                .withArgs(campaignId, donor1.address, mockERC20Address, amountToDonor1, refundComm1);
+
+            expect(await crowdfund.hasReclaimed(campaignId, donor1.address)).to.be.true;
+
+            // Donate again
+            const amount2 = midDonationTokens;
+            const comm2 = (amount2 * initialStartupDonationCommPerc) / 10000n;
+            const net2 = amount2 - comm2;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, amount2);
+            await crowdfund.connect(donor1).donate(campaignId, amount2);
+
+            // Refund 2
+            const refundComm2 = (net2 * initialRefundCommPerc) / 10000n;
+            const amountToDonor2 = net2 - refundComm2;
+            await expect(crowdfund.connect(donor1).claimRefund(campaignId))
+                .to.emit(crowdfund, "RefundClaimed")
+                .withArgs(campaignId, donor1.address, mockERC20Address, amountToDonor2, refundComm2);
+
+            expect(await crowdfund.hasReclaimed(campaignId, donor1.address)).to.be.true;
+        });
+
+        it("Donor can donate, refund, donate again, refund again on two different campaigns", async function () {
+            const { campaignId: campaign2 } = await createActiveCampaign(CampaignType.Charity);
+
+            // Campaign 1 - donate & refund
+            await mockERC20.connect(donor1).approve(crowdfundAddress, smallDonationTokens);
+            await crowdfund.connect(donor1).donate(campaignId, smallDonationTokens);
+            await crowdfund.connect(donor1).claimRefund(campaignId);
+
+            // Campaign 2 - donate & refund
+            await mockERC20.connect(donor1).approve(crowdfundAddress, smallDonationTokens);
+            await crowdfund.connect(donor1).donate(campaign2, smallDonationTokens);
+            await crowdfund.connect(donor1).claimRefund(campaign2);
+
+            expect(await crowdfund.hasReclaimed(campaignId, donor1.address)).to.be.true;
+            expect(await crowdfund.hasReclaimed(campaign2, donor1.address)).to.be.true;
+        });
+    });
+
     describe("Contract Initialization", function () {
         it("Should set the correct owner", async function () {
             expect(await crowdfund.owner()).to.equal(owner.address);
