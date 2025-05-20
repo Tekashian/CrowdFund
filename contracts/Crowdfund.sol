@@ -2,73 +2,26 @@
 pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol"; // OZ v5.x
-import "@openzeppelin/contracts/access/Ownable.sol";       // OZ v5.x
-import "@openzeppelin/contracts/utils/Pausable.sol";      // OZ v5.x
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /**
  * @title Crowdfund Contract (Refactored v5.5.2 - Streamlined Reverts, Comprehensive NatSpec, Fair Failed Refunds, Advanced Commissions)
  * @author [Twoje Imię/Nazwa Firmy/Pseudonim Developera]
- * @notice This contract facilitates ERC20-based crowdfunding campaigns, offering distinct commission structures
- * for donations, successful campaign withdrawals, and (optionally) donor-initiated refunds.
- * It prioritizes donor security by waiving refund commissions for campaigns that do not meet their funding goals.
- * Revert paths have been streamlined relying on Solidity's atomicity for state rollback.
- * @dev Inherits ReentrancyGuard for security against reentrancy attacks, Ownable for access control,
- * and Pausable for emergency stop functionality (all from OpenZeppelin Contracts v5.x).
- * The contract is designed for gas efficiency using custom errors and optimized state management.
- * All monetary values related to campaigns (targets, donations, etc.) are handled in terms of the
- * specific ERC20 token chosen for that campaign.
+ * @notice This contract facilitates ERC20-based crowdfunding campaigns, offering distinct commission structures for donations, withdrawals, and refunds.
+ * @dev Inherits ReentrancyGuard, Ownable, Pausable. All monetary values handled per-campaign in chosen ERC20.
  */
 contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
     // --- Constants ---
-    /**
-     * @notice The duration (in seconds) donors have to reclaim their funds after a campaign creator
-     * initiates an early closure of an 'Active' campaign. Default is 14 days.
-     */
     uint256 public constant RECLAIM_PERIOD = 14 days;
 
     // --- State Variables ---
 
-    /**
-     * @notice Defines the type of a crowdfunding campaign, which can influence commission rates
-     * and potentially other platform-specific logic.
-     */
-    enum CampaignType {
-        Startup, // For new ventures, potentially with higher risk/reward and different commission.
-        Charity  // For non-profit or charitable causes, potentially with lower/no commission.
-    }
-
-    /**
-     * @notice Represents the lifecycle status of a crowdfunding campaign.
-     * @dev Active: Campaign is live, accepting donations. Donors can reclaim funds.
-     * Completed: Funding target reached. Donations may still be accepted until endTime. Creator can withdraw. Refunds typically blocked.
-     * Closing: Creator initiated early closure. A reclaim period is active for donors. No new donations.
-     * Withdrawn: Creator has successfully withdrawn funds from a 'Completed' campaign. Final state.
-     * ClosedByCreator: Creator has withdrawn remaining funds after a 'Closing' period. Final state.
-     * Failed: Campaign endTime passed without reaching target. Donors can reclaim funds. Final state for unsuccessful campaigns.
-     */
+    enum CampaignType { Startup, Charity }
     enum Status { Active, Completed, Closing, Withdrawn, ClosedByCreator, Failed }
 
-    /**
-     * @notice Stores all relevant information for a single crowdfunding campaign.
-     * @param creator The Ethereum address of the user who initiated the campaign.
-     * @param acceptedToken An interface pointer to the ERC20 token contract accepted for donations to this campaign.
-     * @param targetAmount The minimum amount of `acceptedToken` units required for the campaign to be deemed successful.
-     * @param raisedAmount The current net amount of `acceptedToken` units held by this contract for the campaign.
-     * This amount is after initial donation commissions have been deducted and decreases upon donor refunds
-     * or creator withdrawals.
-     * @param totalEverRaised The cumulative gross amount of `acceptedToken` units ever donated to this campaign,
-     * before any commissions are deducted. Useful for UI display and progress tracking.
-     * @param dataCID A content identifier (e.g., IPFS CID) that links to off-chain campaign details
-     * (description, images, documents, etc.).
-     * @param endTime The Unix timestamp (seconds since epoch) marking the deadline for donations.
-     * @param status The current {@link Status} of the campaign.
-     * @param creationTimestamp The Unix timestamp when the campaign was created on the platform.
-     * @param reclaimDeadline The Unix timestamp marking the end of the donor reclaim window. This is only set
-     * if the campaign status is `Closing`.
-     * @param campaignType The {@link CampaignType} of the campaign (Startup or Charity).
-     */
     struct Campaign {
         address creator;
         IERC20 acceptedToken;
@@ -83,58 +36,24 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         CampaignType campaignType;
     }
 
-    /** @notice Maps unique campaign IDs to their corresponding {@link Campaign} struct data. */
     mapping(uint256 => Campaign) public campaigns;
-
-    /**
-     * @notice Tracks the net amount (after initial donation commission) each donor has contributed to a specific campaign.
-     * donations[campaignId][donorAddress] = netAmountContributed.
-     * This value is zeroed out after a successful refund.
-     */
     mapping(uint256 => mapping(address => uint256)) public donations;
-
-    /**
-     * @notice Tracks whether a donor has already reclaimed their funds for a specific campaign
-     * to prevent multiple refunds. hasReclaimed[campaignId][donorAddress] = true if reclaimed.
-     */
     mapping(uint256 => mapping(address => bool)) public hasReclaimed;
 
-    /** @notice A monotonically increasing counter used to generate unique campaign IDs, starting from 1. */
     uint256 public nextCampaignId = 1;
-
-    /** @notice The designated wallet address where all platform commissions (donation, refund, success) are sent. */
     address public commissionWallet;
 
-    // --- Commission Percentages ---
-    // All percentages are stored in basis points: 100 basis points = 1.00% (value / 10000). Max value 10000 (100%).
-
-    /** @notice The commission percentage charged on donations to 'Startup' type campaigns. Deducted at the time of donation. */
     uint256 public startupDonationCommissionPercentage;
-    /** @notice The commission percentage charged on donations to 'Charity' type campaigns. Deducted at the time of donation. */
     uint256 public charityDonationCommissionPercentage;
-
-    /**
-     * @notice The commission percentage charged on the amount a donor reclaims.
-     * @dev This commission is NOT applied if the campaign status is `Failed`, ensuring fairness to donors
-     * in unsuccessful campaigns.
-     */
     uint256 public refundCommissionPercentage;
-
-    /** @notice The commission percentage charged on the total raised amount when a 'Startup' campaign is successfully completed and funds are withdrawn by the creator. */
     uint256 public startupSuccessCommissionPercentage;
-    /** @notice The commission percentage charged on the total raised amount when a 'Charity' campaign is successfully completed and funds are withdrawn by the creator. */
     uint256 public charitySuccessCommissionPercentage;
 
-    // --- Token Whitelisting ---
-    /** @notice Maps an ERC20 token contract address to a boolean indicating if it's whitelisted for use in campaigns. */
     mapping(address => bool) public isTokenWhitelisted;
-    /** @notice Optional mapping from a token's symbol (e.g., "USDC") to its whitelisted contract address for easier lookup. */
     mapping(string => address) public tokenSymbolToAddress;
-    /** @notice An array storing the addresses of all currently whitelisted ERC20 tokens. Useful for frontend display. */
     address[] public whitelistedTokens;
 
     // --- Events ---
-    /** @dev Emitted when a new campaign is successfully created. */
     event CampaignCreated(
         uint256 indexed campaignId,
         address indexed creator,
@@ -145,109 +64,79 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 endTime,
         uint256 creationTimestamp
     );
-    /** @dev Emitted when a donation is successfully received for a campaign. */
     event DonationReceived(
         uint256 indexed campaignId,
         address indexed donor,
         address indexed tokenAddress,
-        uint256 amountGiven,           // Gross amount sent by donor
-        uint256 amountToCampaign,      // Net amount credited to campaign after donation commission
-        uint256 donationCommissionAmount, // Amount of donation commission taken
+        uint256 amountGiven,
+        uint256 amountToCampaign,
+        uint256 donationCommissionAmount,
         uint256 timestamp
     );
-    /** @dev Emitted when a campaign creator successfully withdraws funds from a 'Completed' campaign. */
     event FundsWithdrawn(
         uint256 indexed campaignId,
         address indexed creator,
         address indexed tokenAddress,
-        uint256 amountToCreator,         // Net amount transferred to the creator
-        uint256 successCommissionDeducted // Amount of success commission taken by the platform
+        uint256 amountToCreator,
+        uint256 successCommissionDeducted
     );
-    /** @dev Emitted when a campaign creator initiates the early closure process for an 'Active' campaign. */
     event CampaignClosingInitiated(uint256 indexed campaignId, address indexed initiator, uint256 reclaimDeadline);
-    /** @dev Emitted when a donor successfully reclaims their funds. */
     event RefundClaimed(
         uint256 indexed campaignId,
         address indexed donor,
         address indexed tokenAddress,
-        uint256 amountReturnedToDonor,  // Net amount returned to the donor after potential refund commission
-        uint256 refundCommissionAmount   // Amount of refund commission taken by the platform (0 if campaign failed)
+        uint256 amountReturnedToDonor,
+        uint256 refundCommissionAmount
     );
-    /** @dev Emitted when a campaign creator withdraws remaining funds after a 'Closing' period. */
     event CampaignClosedByCreator(
         uint256 indexed campaignId,
         address indexed creator,
         address indexed tokenAddress,
         uint256 amountWithdrawn,
-        uint256 commissionDeducted // Expected to be 0 for this type of withdrawal as per current logic
+        uint256 commissionDeducted
     );
-    /** @dev Emitted when an 'Active' campaign passes its endTime without meeting its target and is marked as 'Failed'. */
     event CampaignFailedAndClosed(uint256 indexed campaignId, uint256 endTime);
 
-    /** @dev Emitted when the platform's commission wallet address is changed by the owner. */
     event CommissionWalletChanged(address indexed newWallet);
-    /** @dev Emitted when the donation commission percentage for startup campaigns is changed by the owner. */
     event StartupDonationCommissionPercentageChanged(uint256 newPercentage);
-    /** @dev Emitted when the donation commission percentage for charity campaigns is changed by the owner. */
     event CharityDonationCommissionPercentageChanged(uint256 newPercentage);
-    /** @dev Emitted when the refund commission percentage is changed by the owner. */
     event RefundCommissionPercentageChanged(uint256 newPercentage);
-    /** @dev Emitted when the success commission percentage for startup campaigns is changed by the owner. */
     event StartupSuccessCommissionPercentageChanged(uint256 newPercentage);
-    /** @dev Emitted when the success commission percentage for charity campaigns is changed by the owner. */
     event CharitySuccessCommissionPercentageChanged(uint256 newPercentage);
-
-    /** @dev Emitted when a new ERC20 token is added to the whitelist by the owner. */
     event TokenWhitelisted(address indexed tokenAddress, string tokenSymbol);
-    /** @dev Emitted when an ERC20 token is removed from the whitelist by the owner. */
     event TokenRemovedFromWhitelist(address indexed tokenAddress);
-    // Note: The inherited Pausable contract from OpenZeppelin v5.x emits its own Paused(address account)
-    // and Unpaused(address account) events when _pause() or _unpause() are called by the owner functions.
 
     // --- Custom Errors ---
-    // These custom errors are used to provide more specific reasons for transaction failures, saving gas compared to string messages.
     error TargetAmountMustBePositive();
     error EndTimeNotInFuture();
     error DataCIDCannotBeEmpty();
     error InvalidCampaignId();
     error CampaignNotActive();
-    error CampaignNotRefundable();     // When trying to refund from a non-refundable state (e.g., Completed, Withdrawn).
+    error CampaignNotRefundable();
     error CampaignNotClosing();
     error CampaignNotCompleted();
     error CampaignNotFailed();
-    error CampaignHasEnded();          // For actions like donations attempted after endTime.
-    error CampaignReclaimPeriodNotOver(); // When trying to finalize closure too early.
+    error CampaignHasEnded();
+    error CampaignReclaimPeriodNotOver();
     error DonationAmountMustBePositive();
     error NotCampaignCreator();
     error NoDonationToClaim();
-    error TokenTransferFailed(address token, address recipient, uint256 amount); // General ERC20 transfer failure.
+    error TokenTransferFailed(address token, address recipient, uint256 amount);
     error AlreadyReclaimed();
-    error ReclaimPeriodActive();       // When creator tries to act while reclaim period is active for donors.
-    error ReclaimPeriodOver();         // When donor tries to reclaim after reclaim deadline in 'Closing' state.
+    error ReclaimPeriodActive();
+    error ReclaimPeriodOver();
     error CannotCloseCompletedCampaign();
     error CannotCloseFailedCampaign();
-    error InvalidCommissionPercentage(); // If a commission percentage is set > 100%.
-    error CommissionWalletNotSet();    // If commission wallet is address(0).
+    error InvalidCommissionPercentage();
+    error CommissionWalletNotSet();
     error TokenNotWhitelisted(address tokenAddress);
     error TokenAlreadyWhitelisted(address tokenAddress);
     error TokenSymbolAlreadyExists(string tokenSymbol);
     error InvalidTokenAddress();
     error InsufficientTokenAllowance(address tokenOwner, address spender, uint256 required, uint256 current);
-    error RefundAmountExceedsDonation(); // If calculated refund commission is greater than the donation itself.
+    error RefundAmountExceedsDonation();
 
     // --- Constructor ---
-    /**
-     * @notice Initializes the contract with specified parameters.
-     * @dev Sets the initial owner, commission wallet, and various commission percentages.
-     * All percentages are in basis points (100 = 1.00%).
-     * @param _initialOwner The address that will become the owner of this contract.
-     * @param _initialCommissionWallet The address where platform commissions will be collected.
-     * @param _initialStartupDonationCommPerc Initial donation commission for 'Startup' campaigns.
-     * @param _initialCharityDonationCommPerc Initial donation commission for 'Charity' campaigns.
-     * @param _initialRefundCommPerc Initial commission charged on donor refunds (0-10000). Default 1000 (10%).
-     * @param _initialStartupSuccessCommPerc Initial success commission for 'Startup' campaigns. Default 0.
-     * @param _initialCharitySuccessCommPerc Initial success commission for 'Charity' campaigns. Default 0.
-     */
     constructor(
         address _initialOwner,
         address _initialCommissionWallet,
@@ -256,7 +145,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 _initialRefundCommPerc,
         uint256 _initialStartupSuccessCommPerc,
         uint256 _initialCharitySuccessCommPerc
-    ) Ownable(_initialOwner) { // Pass initial owner to Ownable constructor (OZ v3.x+)
+    ) Ownable(_initialOwner) {
         if (_initialCommissionWallet == address(0)) revert CommissionWalletNotSet();
         if (_initialStartupDonationCommPerc > 10000) revert InvalidCommissionPercentage();
         if (_initialCharityDonationCommPerc > 10000) revert InvalidCommissionPercentage();
@@ -273,12 +162,6 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     }
 
     // --- Modifier ---
-    /**
-     * @dev Modifier to ensure a function is only callable when the contract is not paused.
-     * It relies on the `paused()` view function from the inherited `Pausable` contract.
-     * Note: OpenZeppelin's `Pausable` already provides a `whenNotPaused` modifier. This custom one is kept for consistency
-     * if it was used previously or if specific revert messages are desired (though current uses standard OZ message).
-     */
     modifier whenNotPausedCustom() {
         require(!paused(), "Pausable: paused");
         _;
@@ -286,67 +169,36 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
     // --- Commission Management Functions (Owner Only) ---
 
-    /**
-     * @notice Updates the wallet address where platform commissions are collected.
-     * @dev Only callable by the contract owner. The new wallet address cannot be the zero address.
-     * @param _newCommissionWallet The new address for the commission wallet.
-     */
     function setCommissionWallet(address _newCommissionWallet) public onlyOwner {
         if (_newCommissionWallet == address(0)) revert CommissionWalletNotSet();
         commissionWallet = _newCommissionWallet;
         emit CommissionWalletChanged(_newCommissionWallet);
     }
 
-    /**
-     * @notice Updates the donation commission percentage for 'Startup' type campaigns.
-     * @dev Only callable by the contract owner. Percentage in basis points (max 10000 for 100%).
-     * @param _newPercentage The new commission percentage.
-     */
     function setStartupDonationCommissionPercentage(uint256 _newPercentage) public onlyOwner {
         if (_newPercentage > 10000) revert InvalidCommissionPercentage();
         startupDonationCommissionPercentage = _newPercentage;
         emit StartupDonationCommissionPercentageChanged(_newPercentage);
     }
 
-    /**
-     * @notice Updates the donation commission percentage for 'Charity' type campaigns.
-     * @dev Only callable by the contract owner. Percentage in basis points (max 10000 for 100%).
-     * @param _newPercentage The new commission percentage.
-     */
     function setCharityDonationCommissionPercentage(uint256 _newPercentage) public onlyOwner {
         if (_newPercentage > 10000) revert InvalidCommissionPercentage();
         charityDonationCommissionPercentage = _newPercentage;
         emit CharityDonationCommissionPercentageChanged(_newPercentage);
     }
 
-    /**
-     * @notice Updates the commission percentage charged on donor refunds.
-     * @dev Only callable by the contract owner. Not applied if campaign status is 'Failed'.
-     * Percentage in basis points (max 10000 for 100%).
-     * @param _newPercentage The new refund commission percentage.
-     */
     function setRefundCommissionPercentage(uint256 _newPercentage) public onlyOwner {
         if (_newPercentage > 10000) revert InvalidCommissionPercentage();
         refundCommissionPercentage = _newPercentage;
         emit RefundCommissionPercentageChanged(_newPercentage);
     }
 
-    /**
-     * @notice Updates the success commission percentage for completed 'Startup' campaigns.
-     * @dev Only callable by the contract owner. Percentage in basis points (max 10000 for 100%).
-     * @param _newPercentage The new success commission percentage for startups.
-     */
     function setStartupSuccessCommissionPercentage(uint256 _newPercentage) public onlyOwner {
         if (_newPercentage > 10000) revert InvalidCommissionPercentage();
         startupSuccessCommissionPercentage = _newPercentage;
         emit StartupSuccessCommissionPercentageChanged(_newPercentage);
     }
 
-    /**
-     * @notice Updates the success commission percentage for completed 'Charity' campaigns.
-     * @dev Only callable by the contract owner. Percentage in basis points (max 10000 for 100%).
-     * @param _newPercentage The new success commission percentage for charities.
-     */
     function setCharitySuccessCommissionPercentage(uint256 _newPercentage) public onlyOwner {
         if (_newPercentage > 10000) revert InvalidCommissionPercentage();
         charitySuccessCommissionPercentage = _newPercentage;
@@ -354,13 +206,6 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     }
 
     // --- Token Whitelisting Functions (Owner Only) ---
-    /**
-     * @notice Adds an ERC20 token to the whitelist, allowing it to be used for campaigns.
-     * @dev Only callable by the contract owner. Token address cannot be zero.
-     * Symbol mapping is optional but helpful.
-     * @param _tokenAddress The contract address of the ERC20 token.
-     * @param _tokenSymbol The symbol of the token (e.g., "USDC").
-     */
     function addAcceptedToken(address _tokenAddress, string memory _tokenSymbol) public onlyOwner {
         if (_tokenAddress == address(0)) revert InvalidTokenAddress();
         if (isTokenWhitelisted[_tokenAddress]) revert TokenAlreadyWhitelisted(_tokenAddress);
@@ -375,37 +220,21 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         emit TokenWhitelisted(_tokenAddress, _tokenSymbol);
     }
 
-    /**
-     * @notice Removes an ERC20 token from the whitelist.
-     * @dev Only callable by the contract owner. Caution should be exercised if active campaigns use this token.
-     * @param _tokenAddress The contract address of the ERC20 token to remove.
-     */
     function removeAcceptedToken(address _tokenAddress) public onlyOwner {
         if (!isTokenWhitelisted[_tokenAddress]) revert TokenNotWhitelisted(_tokenAddress);
         isTokenWhitelisted[_tokenAddress] = false;
-        // Efficiently remove from array by swapping with last element and popping
         for (uint i = 0; i < whitelistedTokens.length; i++) {
             if (whitelistedTokens[i] == _tokenAddress) {
                 whitelistedTokens[i] = whitelistedTokens[whitelistedTokens.length - 1];
                 whitelistedTokens.pop();
-                break; // Assume unique addresses in whitelist
+                break;
             }
         }
-        // Note: Does not remove from tokenSymbolToAddress to save gas; stale symbol entry might remain.
-        // UI should primarily rely on isTokenWhitelisted or the whitelistedTokens array.
         emit TokenRemovedFromWhitelist(_tokenAddress);
     }
 
     // --- Campaign Management Functions ---
-    /**
-     * @notice Allows any user to create a new crowdfunding campaign.
-     * @dev The contract must not be paused. The chosen ERC20 token must be whitelisted.
-     * @param _campaignType The {@link CampaignType} (Startup or Charity).
-     * @param _acceptedTokenAddress The address of the whitelisted ERC20 token for this campaign.
-     * @param _targetAmount The funding goal in the smallest units of the `_acceptedTokenAddress`. Must be > 0.
-     * @param _dataCID A content identifier (e.g., IPFS CID) for off-chain campaign details. Must not be empty.
-     * @param _endTime The Unix timestamp for the campaign's fundraising deadline. Must be in the future.
-     */
+
     function createCampaign(
         CampaignType _campaignType,
         address _acceptedTokenAddress,
@@ -436,11 +265,7 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
-     * @notice Allows any user to donate to an 'Active' campaign before its `endTime`.
-     * @dev The contract must not be paused. The donor must first `approve` this contract to spend their tokens.
-     * A donation commission may be deducted. Reentrancy is guarded.
-     * @param _campaignId The ID of the campaign to donate to.
-     * @param _donationAmount The amount of `acceptedToken` units to donate. Must be > 0.
+     * @notice Donate to a campaign – now with improved commission payout order for ERC20 tokens (like USDC).
      */
     function donate(uint256 _campaignId, uint256 _donationAmount) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
@@ -464,7 +289,17 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 actualDonationCommission = (_donationAmount * donationCommRate) / 10000;
         uint256 amountToCampaign = _donationAmount - actualDonationCommission;
 
-        // --- Effects ---
+        // --- Interactions: Najpierw transferujemy całość z portfela użytkownika do kontraktu
+        bool success = token.transferFrom(msg.sender, address(this), _donationAmount);
+        if (!success) revert TokenTransferFailed(address(token), address(this), _donationAmount);
+
+        // --- Interactions: Potem wysyłamy prowizję na wallet prowizyjny (z kontraktu)
+        if (actualDonationCommission > 0) {
+            success = token.transfer(commissionWallet, actualDonationCommission);
+            if (!success) revert TokenTransferFailed(address(token), commissionWallet, actualDonationCommission);
+        }
+
+        // --- Effects: Dopiero teraz zapisujemy dotację netto i podbijamy stan kampanii
         campaign.raisedAmount += amountToCampaign;
         campaign.totalEverRaised += _donationAmount;
         donations[_campaignId][msg.sender] += amountToCampaign;
@@ -475,25 +310,8 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         emit DonationReceived(
             _campaignId, msg.sender, address(token), _donationAmount, amountToCampaign, actualDonationCommission, block.timestamp
         );
-
-        // --- Interactions ---
-        bool success = token.transferFrom(msg.sender, address(this), _donationAmount);
-        if (!success) revert TokenTransferFailed(address(token), address(this), _donationAmount);
-
-        if (actualDonationCommission > 0) {
-            success = token.transfer(commissionWallet, actualDonationCommission);
-            if (!success) revert TokenTransferFailed(address(token), commissionWallet, actualDonationCommission);
-        }
     }
 
-    /**
-     * @notice Allows a donor to reclaim their net contributed funds from a campaign.
-     * @dev Applicable if campaign is 'Active', 'Closing' (within `reclaimDeadline`), or 'Failed'.
-     * A refund commission may be charged (based on `refundCommissionPercentage`),
-     * except if the campaign status is 'Failed', in which case no refund commission is applied.
-     * Reentrancy guarded.
-     * @param _campaignId The ID of the campaign.
-     */
     function claimRefund(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
@@ -514,47 +332,37 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         uint256 actualRefundCommission = 0;
         uint256 amountToReturnToDonor = netDonationByDonor;
 
-        // Apply refund commission only if the campaign is NOT Failed and a commission rate is set.
         if (currentStatus != Status.Failed && refundCommissionPercentage > 0) {
             actualRefundCommission = (netDonationByDonor * refundCommissionPercentage) / 10000;
             if (actualRefundCommission > netDonationByDonor) { 
-                revert RefundAmountExceedsDonation(); // Should not happen with percentage <= 10000
+                revert RefundAmountExceedsDonation();
             }
             amountToReturnToDonor = netDonationByDonor - actualRefundCommission;
         }
 
-        // --- Effects ---
         hasReclaimed[_campaignId][msg.sender] = true;
         donations[_campaignId][msg.sender] = 0;
-        campaign.raisedAmount -= netDonationByDonor; // Full netDonationByDonor is removed from campaign's pool
+        campaign.raisedAmount -= netDonationByDonor;
 
         if (campaign.status == Status.Completed && campaign.raisedAmount < campaign.targetAmount) {
             campaign.status = Status.Active;
         }
         emit RefundClaimed(_campaignId, msg.sender, address(token), amountToReturnToDonor, actualRefundCommission);
 
-        // --- Interactions ---
         if (actualRefundCommission > 0) {
             bool commissionSuccess = token.transfer(commissionWallet, actualRefundCommission);
             if (!commissionSuccess) {
-                // Revert will automatically undo state changes made above in this function call.
                 revert TokenTransferFailed(address(token), commissionWallet, actualRefundCommission);
             }
         }
         if (amountToReturnToDonor > 0) {
             bool donorSuccess = token.transfer(msg.sender, amountToReturnToDonor);
             if (!donorSuccess) {
-                // Revert will automatically undo state changes, including the commission transfer if it occurred.
                 revert TokenTransferFailed(address(token), msg.sender, amountToReturnToDonor);
             }
         }
     }
 
-    /**
-     * @notice Allows the campaign creator to initiate an early closure for an 'Active' campaign.
-     * @dev Sets campaign status to 'Closing' and starts the `RECLAIM_PERIOD` for donors.
-     * @param _campaignId The ID of the 'Active' campaign.
-     */
     function initiateClosure(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
@@ -569,12 +377,6 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         emit CampaignClosingInitiated(_campaignId, msg.sender, campaign.reclaimDeadline);
     }
 
-    /**
-     * @notice Allows the campaign creator to withdraw remaining funds from a 'Closing' campaign
-     * after the `RECLAIM_PERIOD` has ended.
-     * @dev No success commission is applied in this scenario by default.
-     * @param _campaignId The ID of the 'Closing' campaign.
-     */
     function finalizeClosureAndWithdraw(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
@@ -586,26 +388,18 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
 
         uint256 amountToWithdraw = campaign.raisedAmount;
 
-        // --- Effects ---
         campaign.raisedAmount = 0;
         campaign.status = Status.ClosedByCreator;
-        emit CampaignClosedByCreator(_campaignId, msg.sender, address(token), amountToWithdraw, 0); // 0 for commissionDeducted
+        emit CampaignClosedByCreator(_campaignId, msg.sender, address(token), amountToWithdraw, 0);
 
-        // --- Interaction ---
         if (amountToWithdraw > 0) {
             bool success = token.transfer(campaign.creator, amountToWithdraw);
             if (!success) {
-                // Revert will automatically undo state changes made above.
                 revert TokenTransferFailed(address(token), campaign.creator, amountToWithdraw);
             }
         }
     }
 
-    /**
-     * @notice Allows the campaign creator to withdraw funds from a 'Completed' campaign.
-     * @dev A success commission may be deducted based on campaign type and configured rates.
-     * @param _campaignId The ID of the 'Completed' campaign.
-     */
     function withdrawFunds(uint256 _campaignId) public nonReentrant whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
@@ -625,133 +419,76 @@ contract Crowdfund is ReentrancyGuard, Ownable, Pausable {
         if (successCommRate > 0) {
             actualSuccessCommission = (amountAvailableForWithdrawal * successCommRate) / 10000;
             if (actualSuccessCommission > amountAvailableForWithdrawal) {
-                actualSuccessCommission = amountAvailableForWithdrawal; // Cap commission
+                actualSuccessCommission = amountAvailableForWithdrawal;
             }
             amountToCreator = amountAvailableForWithdrawal - actualSuccessCommission;
         }
 
-        // --- Effects ---
         campaign.raisedAmount = 0;
         campaign.status = Status.Withdrawn;
         emit FundsWithdrawn(_campaignId, msg.sender, address(token), amountToCreator, actualSuccessCommission);
 
-        // --- Interactions ---
         if (actualSuccessCommission > 0) {
             bool commissionSuccess = token.transfer(commissionWallet, actualSuccessCommission);
             if (!commissionSuccess) {
-                // Revert will automatically undo state changes made above.
                 revert TokenTransferFailed(address(token), commissionWallet, actualSuccessCommission);
             }
         }
         if (amountToCreator > 0) {
             bool creatorSuccess = token.transfer(campaign.creator, amountToCreator);
             if (!creatorSuccess) {
-                // Revert will automatically undo state changes, including potential commission transfer.
                 revert TokenTransferFailed(address(token), campaign.creator, amountToCreator);
             }
         }
     }
 
-    /**
-     * @notice Allows anyone to mark an 'Active' campaign as 'Failed' if its `endTime` has passed
-     * and the funding target was not met.
-     * @dev This enables donors to reclaim funds from unsuccessful campaigns via `claimRefund`.
-     * @param _campaignId The ID of the campaign to potentially mark as failed.
-     */
     function failCampaignIfUnsuccessful(uint256 _campaignId) public whenNotPausedCustom {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) revert InvalidCampaignId();
         Campaign storage campaign = campaigns[_campaignId];
 
         if (campaign.status != Status.Active) revert CampaignNotActive();
-         // The original check `block.timestamp < campaign.endTime` would revert if the campaign has *not* ended.
-         // It should revert if `endTime` has not passed yet.
-         // The correct check to ensure endTime has passed is `block.timestamp >= campaign.endTime`.
-         // However, the custom error `CampaignHasEnded` implies it's for actions *after* it has ended.
-         // For this function, we want to proceed *if* it has ended. So, the check should be `block.timestamp < campaign.endTime` and then revert.
-        if (block.timestamp < campaign.endTime) revert EndTimeNotInFuture(); // Corrected logic: use an error that implies campaign end time hasn't been reached. Or create a specific one.
-                                                                         // Let's use `EndTimeNotInFuture` for now if it fits, or adjust the error message.
-                                                                         // A better error would be `CampaignNotYetEnded`. For now, reusing `CampaignHasEnded` as in original, but noting the check.
-                                                                         // The original error `CampaignHasEnded` was used with `<`. If the intention is to only allow failing *after* it has ended,
-                                                                         // then the condition `block.timestamp < campaign.endTime` implies "it has NOT ended, so you can't fail it yet".
-                                                                         // The error message `CampaignHasEnded` is confusing in that context.
-                                                                         // Let's assume original intent: revert if not ended.
-        if (block.timestamp < campaign.endTime) revert CampaignHasEnded(); // Reverting to original condition and error for minimal changes beyond the new function.
-
+        if (block.timestamp < campaign.endTime) revert EndTimeNotInFuture();
         if (campaign.targetAmount > 0 && campaign.raisedAmount >= campaign.targetAmount) {
-            revert("CampaignTargetMetCannotFail"); // Consider making this a custom error for gas savings
+            revert("CampaignTargetMetCannotFail");
         }
         campaign.status = Status.Failed;
         emit CampaignFailedAndClosed(_campaignId, campaign.endTime);
     }
 
     // --- Pausable Control (Owner Only) ---
-    /** @notice Pauses the contract, restricting major state-changing operations. */
     function pauseContract() public onlyOwner { _pause(); }
-    /** @notice Unpauses the contract, resuming normal operations. */
     function unpauseContract() public onlyOwner { _unpause(); }
 
     // --- View Functions ---
-    /**
-     * @notice Retrieves all details for a specific campaign.
-     * @param _campaignId The ID of the campaign to query.
-     * @return campaignData A {@link Campaign} struct containing the campaign's information.
-     */
     function getCampaignDetails(uint256 _campaignId) public view returns (Campaign memory campaignData) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) {
              revert InvalidCampaignId();
         }
         return campaigns[_campaignId];
     }
-
-    /**
-     * @notice Retrieves all created campaigns.
-     * @dev Iterates through all campaign IDs from 1 up to (but not including) `nextCampaignId`.
-     * @return An array of {@link Campaign} structs, each representing a campaign.
-     * Note: This function can be gas-intensive if the number of campaigns is very large when called on-chain.
-     * For off-chain queries (e.g. via web3 libraries), it's generally fine.
-     */
     function getAllCampaigns() public view returns (Campaign[] memory) {
         uint256 campaignCount = nextCampaignId - 1;
         Campaign[] memory allCampaignsArray = new Campaign[](campaignCount);
         for (uint256 i = 1; i <= campaignCount; i++) {
-            // Assuming campaign IDs are sequential and start from 1.
-            // `campaigns[0]` would be empty/default.
             allCampaignsArray[i-1] = campaigns[i];
         }
         return allCampaignsArray;
     }
-
-    /**
-     * @notice Retrieves the creator's address for a specific campaign.
-     * @param _campaignId The ID of the campaign.
-     * @return creatorAddress The Ethereum address of the campaign's creator.
-     */
     function getCampaignCreator(uint256 _campaignId) public view returns (address creatorAddress) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId && campaigns[_campaignId].creationTimestamp > 0)) {
             revert InvalidCampaignId();
         }
         return campaigns[_campaignId].creator;
     }
-    /**
-     * @notice Retrieves the net amount a specific donor has contributed to a campaign.
-     * @param _campaignId The ID of the campaign.
-     * @param _donor The address of the donor.
-     * @return The net amount donated (after initial donation commission).
-     */
     function getDonationAmountForDonor(uint256 _campaignId, address _donor) public view returns (uint256) {
         if (!(_campaignId > 0 && _campaignId < nextCampaignId)) {
-            // If campaignId is potentially 0 or out of current range, but might exist in future if nextCampaignId wraps (highly unlikely)
-            // A check for campaigns[_campaignId].creationTimestamp > 0 would be more robust if allowing non-sequential IDs
             revert InvalidCampaignId();
         }
-        // campaigns[_campaignId].creationTimestamp > 0 check is implicit in the nextCampaignId check for valid IDs
         return donations[_campaignId][_donor];
     }
-    /** @notice Retrieves the list of all whitelisted ERC20 token addresses. */
     function getWhitelistedTokens() public view returns (address[] memory) {
         return whitelistedTokens;
     }
-    /** @notice Checks if a given ERC20 token address is currently whitelisted. */
     function checkIsTokenWhitelisted(address _tokenAddress) public view returns (bool) {
         return isTokenWhitelisted[_tokenAddress];
     }
