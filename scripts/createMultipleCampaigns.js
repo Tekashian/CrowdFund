@@ -4,7 +4,7 @@ const { ethers } = hre;
 
 // --- Konfiguracja ---
 // !!! WAŻNE: Upewnij się, że to jest ADRES TWOJEGO OSTATNIO WDROŻONEGO KONTRAKTU CROWDFUND NA SEPOLIA !!!
-const CROWDFUND_CONTRACT_ADDRESS_SEPOLIA = "0xF6869EB6122288FA694b3DFEe9C4e6fc00792fC3"; // Adres Twojego wdrożonego kontraktu Crowdfund
+const CROWDFUND_CONTRACT_ADDRESS_SEPOLIA = "0x768b51618dBb234629B84a224f630E2a23Ee2Bbc"; // Adres Twojego wdrożonego kontraktu Crowdfund
 // !!! WAŻNE: Adres kontraktu USDC na sieci Sepolia (często używany, zweryfikuj lub użyj swojego jeśli masz inny)
 const USDC_SEPOLIA_ADDRESS = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"; // Potwierdź ten adres!
 const USDC_DECIMALS = 6; // USDC standardowo ma 6 miejsc po przecinku
