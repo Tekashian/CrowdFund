@@ -3,7 +3,7 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
-// Main test suite for the Crowdfund contract (v5.5.1 - ERC20, Advanced Commissions)
+// Main test suite for the Crowdfund contract (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)
 describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)", function () {
     // Shared variables for tests
     let Crowdfund, crowdfund;
@@ -42,6 +42,7 @@ describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)"
         Withdrawn: 3n,
         ClosedByCreator: 4n,
         Failed: 5n,
+        Cancelled: 6n  // Added if referenced
     };
     const CampaignType = { Startup: 0n, Charity: 1n };
 
@@ -476,13 +477,193 @@ describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)"
 
             expect(await mockERC20.balanceOf(donor1.address)).to.equal(initialDonorBal + netDonationByDonor1);
             expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal);
+            expect(await crowdfund.donations(campaignId, donor1.address)).to.equal(0);
         });
 
-        // ... (Add other refund tests: Closing state, already reclaimed, no donation, invalid status, reclaim period over for Closing)
+        it("Should allow donor to claim refund if campaign is Closing and within reclaim period", async function () {
+            await crowdfund.connect(creatorAcc).initiateClosure(campaignId);
+            const camp = await getCampaignState(campaignId);
+            expect(camp.status).to.equal(Status.Closing);
+
+            const [initialDonorBal, initialCfBal, initialCommBal] = await Promise.all([
+              mockERC20.balanceOf(donor1.address),
+              mockERC20.balanceOf(crowdfundAddress),
+              mockERC20.balanceOf(commissionRecipient.address)
+            ]);
+
+            const tx = await crowdfund.connect(donor1).claimRefund(campaignId);
+
+            const expectedRefundComm = (netDonationByDonor1 * initialRefundCommPerc) / 10000n;
+            const expectedAmountToDonor = netDonationByDonor1 - expectedRefundComm;
+
+            await expect(tx).to.emit(crowdfund, "RefundClaimed")
+                .withArgs(campaignId, donor1.address, mockERC20Address, expectedAmountToDonor, expectedRefundComm);
+
+            expect(await mockERC20.balanceOf(donor1.address)).to.equal(initialDonorBal + expectedAmountToDonor);
+            expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal + expectedRefundComm);
+            expect(await mockERC20.balanceOf(crowdfundAddress)).to.equal(initialCfBal - netDonationByDonor1);
+            expect(await crowdfund.donations(campaignId, donor1.address)).to.equal(0);
+        });
+
+        it("Should revert refund if campaign is Closing and reclaim period is over", async function () {
+            await crowdfund.connect(creatorAcc).initiateClosure(campaignId);
+            const camp = await getCampaignState(campaignId);
+            await time.increaseTo(camp.reclaimDeadline + 1n);
+            await expect(crowdfund.connect(donor1).claimRefund(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "ReclaimPeriodOver");
+        });
+
+        it("Should revert refund if donor has already reclaimed", async function () {
+            await crowdfund.connect(donor1).claimRefund(campaignId);
+            await expect(crowdfund.connect(donor1).claimRefund(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "AlreadyReclaimed");
+        });
+
+        it("Should revert refund if donor did not donate", async function () {
+            await mockERC20.connect(donor2).approve(crowdfundAddress, smallDonationTokens);
+            await expect(crowdfund.connect(donor2).claimRefund(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "NoDonationToClaim");
+        });
+
+        it("Should revert refund if campaign status is not refundable (e.g. Withdrawn)", async function () {
+            // Force campaign to Completed and then withdraw
+            const grossToMeetTarget = (targetAmountTokens * 10000n) / (10000n - initialStartupDonationCommPerc) + 1n;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, grossToMeetTarget);
+            await crowdfund.connect(donor1).donate(campaignId, grossToMeetTarget);
+            await crowdfund.connect(creatorAcc).withdrawFunds(campaignId);
+            const camp = await getCampaignState(campaignId);
+            expect(camp.status).to.equal(Status.Withdrawn);
+            await expect(crowdfund.connect(donor1).claimRefund(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "CampaignNotRefundable");
+        });
     });
 
     describe("Campaign Closure and Withdrawals (ERC20)", function () {
-        // ... (Tests for initiateClosure, finalizeClosureAndWithdraw - adapt from Ether based tests, using token balances)
+        let campaignId;
+        let netDonation;
+
+        beforeEach(async function() {
+            const campDetails = await createActiveCampaign(CampaignType.Startup, creatorAcc);
+            campaignId = campDetails.campaignId;
+            // Donor1 donates
+            await mockERC20.connect(donor1).approve(crowdfundAddress, smallDonationTokens);
+            await crowdfund.connect(donor1).donate(campaignId, smallDonationTokens);
+            netDonation = smallDonationTokens - (smallDonationTokens * initialStartupDonationCommPerc / 10000n);
+        });
+
+        it("Should allow creator to initiate closure and donors to refund during reclaim", async function () {
+            // Initiate closure
+            const txClose = await crowdfund.connect(creatorAcc).initiateClosure(campaignId);
+            const campAfterClose = await getCampaignState(campaignId);
+            expect(campAfterClose.status).to.equal(Status.Closing);
+            expect(campAfterClose.reclaimDeadline).to.be.gt(campAfterClose.creationTimestamp);
+
+            // Donor1 claims refund within reclaim period
+            const [initialDonorBal, initialCommBal, initialCfBal] = await Promise.all([
+                mockERC20.balanceOf(donor1.address),
+                mockERC20.balanceOf(commissionRecipient.address),
+                mockERC20.balanceOf(crowdfundAddress)
+            ]);
+            const txRefund = await crowdfund.connect(donor1).claimRefund(campaignId);
+            const expectedRefundComm = (netDonation * initialRefundCommPerc) / 10000n;
+            const expectedReturn = netDonation - expectedRefundComm;
+
+            await expect(txRefund).to.emit(crowdfund, "RefundClaimed")
+                .withArgs(campaignId, donor1.address, mockERC20Address, expectedReturn, expectedRefundComm);
+
+            expect(await mockERC20.balanceOf(donor1.address)).to.equal(initialDonorBal + expectedReturn);
+            expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal + expectedRefundComm);
+            expect(await mockERC20.balanceOf(crowdfundAddress)).to.equal(initialCfBal - netDonation);
+            // raisedAmount reduced
+            const campAfterRefund = await getCampaignState(campaignId);
+            expect(campAfterRefund.raisedAmount).to.equal(0n);
+        });
+
+        it("Should allow creator to withdraw remaining funds after reclaim period (manual closure)", async function () {
+            // Donor2 also donates
+            await mockERC20.connect(donor2).approve(crowdfundAddress, smallDonationTokens);
+            await crowdfund.connect(donor2).donate(campaignId, smallDonationTokens);
+            const netDonation2 = smallDonationTokens - (smallDonationTokens * initialStartupDonationCommPerc / 10000n);
+
+            // Initiate closure
+            await crowdfund.connect(creatorAcc).initiateClosure(campaignId);
+            const camp = await getCampaignState(campaignId);
+            const deadline = camp.reclaimDeadline;
+
+            // Donor2 claims refund within reclaim period
+            await time.increaseTo(deadline - 1n);
+            await crowdfund.connect(donor2).claimRefund(campaignId);
+            // After donor2's refund, only netDonation (donor1) remains.
+
+            // Advance past reclaim deadline
+            await time.increaseTo(deadline + 1n);
+
+            // Creator withdraws remaining netDonation (from donor1)
+            const [initialCreatorBal, initialCommBal] = await Promise.all([
+                mockERC20.balanceOf(creatorAcc.address),
+                mockERC20.balanceOf(commissionRecipient.address)
+            ]);
+            const txWithdraw = await crowdfund.connect(creatorAcc).finalizeClosureAndWithdraw(campaignId);
+            await expect(txWithdraw).to.emit(crowdfund, "CampaignClosedByCreator")
+                .withArgs(campaignId, creatorAcc.address, mockERC20Address, netDonation, 0);
+
+            expect(await mockERC20.balanceOf(creatorAcc.address)).to.equal(initialCreatorBal + netDonation);
+            expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal);
+            const campAfterWithdraw = await getCampaignState(campaignId);
+            expect(campAfterWithdraw.status).to.equal(Status.ClosedByCreator);
+            expect(campAfterWithdraw.raisedAmount).to.equal(0n);
+        });
+
+        it("Should allow creator to withdraw from automatically failed campaign after reclaim period", async function () {
+            // Donor1 donated already in beforeEach
+            // Fast-forward past endTime
+            const campInfo = await getCampaignState(campaignId);
+            await time.increaseTo(campInfo.endTime + 1n);
+
+            // Mark campaign as Failed
+            await crowdfund.connect(nonParticipant).failCampaignIfUnsuccessful(campaignId);
+            const failedCamp = await getCampaignState(campaignId);
+            expect(failedCamp.status).to.equal(Status.Failed);
+            const deadline = failedCamp.reclaimDeadline;
+
+            // Wait until after reclaim period
+            await time.increaseTo(deadline + 1n);
+
+            // Creator withdraws failed-campaign funds
+            const [initialCreatorBal, initialCommBal] = await Promise.all([
+                mockERC20.balanceOf(creatorAcc.address),
+                mockERC20.balanceOf(commissionRecipient.address)
+            ]);
+
+            const tx = await crowdfund.connect(creatorAcc).withdrawFailedCampaignFunds(campaignId);
+            await expect(tx).to.emit(crowdfund, "FailedFundsWithdrawn")
+                .withArgs(campaignId, creatorAcc.address, mockERC20Address, netDonation);
+
+            expect(await mockERC20.balanceOf(creatorAcc.address)).to.equal(initialCreatorBal + netDonation);
+            expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal);
+            const finalCampState = await getCampaignState(campaignId);
+            expect(finalCampState.status).to.equal(Status.ClosedByCreator);
+            expect(finalCampState.raisedAmount).to.equal(0n);
+        });
+
+        it("Should revert finalizeClosureAndWithdraw if called before reclaim deadline", async function () {
+            // Initiate closure
+            await crowdfund.connect(creatorAcc).initiateClosure(campaignId);
+            await expect(crowdfund.connect(creatorAcc).finalizeClosureAndWithdraw(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "ReclaimPeriodActive");
+        });
+
+        it("Should revert closure initiation if not creator or wrong status", async function () {
+            await mockERC20.connect(donor1).approve(crowdfundAddress, 0);
+            await expect(crowdfund.connect(donor1).initiateClosure(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "NotCampaignCreator");
+            // Force to Completed then try to close
+            const grossToMeetTarget = (targetAmountTokens * 10000n) / (10000n - initialStartupDonationCommPerc) + 1n;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, grossToMeetTarget);
+            await crowdfund.connect(donor1).donate(campaignId, grossToMeetTarget);
+            await expect(crowdfund.connect(creatorAcc).initiateClosure(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "CampaignNotActive");
+        });
     });
 
     describe("Standard Withdrawal from Completed Campaign (ERC20)", function () {
@@ -525,7 +706,45 @@ describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)"
             expect(finalCampState.status).to.equal(Status.Withdrawn);
             expect(finalCampState.raisedAmount).to.equal(0n);
         });
-        // ... (More withdrawal tests: charity success commission, 0% success commission, not creator, not completed etc.)
+
+        it("Should revert withdrawal if not creator", async function () {
+            await expect(crowdfund.connect(donor1).withdrawFunds(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "NotCampaignCreator");
+        });
+
+        it("Should revert withdrawal if campaign not Completed", async function () {
+            // Create a new campaign that is still Active
+            const { campaignId: newId } = await createActiveCampaign();
+            await expect(crowdfund.connect(creatorAcc).withdrawFunds(newId))
+                .to.be.revertedWithCustomError(crowdfund, "CampaignNotCompleted");
+        });
+
+        it("Should allow charity campaign to apply charity success commission", async function () {
+            // Create charity campaign
+            await crowdfund.connect(owner).setCharitySuccessCommissionPercentage(initialCharitySuccessCommPerc);
+            const { campaignId: charityId } = await createActiveCampaign(CampaignType.Charity, creatorAcc, campaignDurationSeconds, targetAmountTokens);
+            const grossToMeet = (targetAmountTokens * 10000n) / (10000n - initialCharityDonationCommPerc) + 1n;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, grossToMeet);
+            await crowdfund.connect(donor1).donate(charityId, grossToMeet);
+            const campState = await getCampaignState(charityId);
+            expect(campState.status).to.equal(Status.Completed);
+            const netCharityRaised = campState.raisedAmount;
+
+            const [initialCreatorBal, initialCommBal] = await Promise.all([
+              mockERC20.balanceOf(creatorAcc.address),
+              mockERC20.balanceOf(commissionRecipient.address)
+            ]);
+
+            const tx = await crowdfund.connect(creatorAcc).withdrawFunds(charityId);
+            const expectedComm = (netCharityRaised * initialCharitySuccessCommPerc) / 10000n;
+            const expectedToCreator = netCharityRaised - expectedComm;
+
+            await expect(tx).to.emit(crowdfund, "FundsWithdrawn")
+                .withArgs(charityId, creatorAcc.address, mockERC20Address, expectedToCreator, expectedComm);
+
+            expect(await mockERC20.balanceOf(creatorAcc.address)).to.equal(initialCreatorBal + expectedToCreator);
+            expect(await mockERC20.balanceOf(commissionRecipient.address)).to.equal(initialCommBal + expectedComm);
+        });
     });
 
     describe("Reentrancy Guard (Conceptual for ERC20)", function () {
@@ -656,4 +875,66 @@ describe("Crowdfund (v5.5.1 - ERC20, Advanced Commissions, based on v4.1 tests)"
         });
     });
 
+    // --- ADDED TESTS FOR NEW FUNCTIONS --- //
+
+    describe("Helper isActuallyFailed and cancelCampaign behaviour", function () {
+        it("isActuallyFailed should return false before endTime", async function () {
+            const { campaignId } = await createActiveCampaign();
+            const isFailed = await crowdfund.isActuallyFailed(campaignId);
+            expect(isFailed).to.be.false;
+        });
+
+        it("isActuallyFailed should return true after endTime if target not met and fail not called", async function () {
+            const { campaignId, endTime } = await createActiveCampaign();
+            // No donations
+            await time.increaseTo(endTime + 1n);
+            const isFailed = await crowdfund.isActuallyFailed(campaignId);
+            expect(isFailed).to.be.true;
+
+            // Status remains Active
+            const camp = await getCampaignState(campaignId);
+            expect(camp.status).to.equal(Status.Active);
+        });
+
+        it("isActuallyFailed should return false if target met", async function () {
+            const { campaignId, endTime } = await createActiveCampaign();
+            // Make a donation meeting target net
+            const grossToMeet = (targetAmountTokens * 10000n) / (10000n - initialStartupDonationCommPerc) + 1n;
+            await mockERC20.connect(donor1).approve(crowdfundAddress, grossToMeet);
+            await crowdfund.connect(donor1).donate(campaignId, grossToMeet);
+            // Fast forward past endTime
+            await time.increaseTo(endTime + 1n);
+            const isFailed = await crowdfund.isActuallyFailed(campaignId);
+            expect(isFailed).to.be.false;
+        });
+
+        it("cancelCampaign should allow cancellation when raisedAmount == 0", async function () {
+            const { campaignId } = await createActiveCampaign();
+            await expect(crowdfund.connect(creatorAcc).cancelCampaign(campaignId))
+                .to.emit(crowdfund, "CampaignCancelled")
+                .withArgs(campaignId, creatorAcc.address);
+            const camp = await getCampaignState(campaignId);
+            expect(camp.status).to.equal(Status.Cancelled);
+        });
+
+        it("cancelCampaign should revert when raisedAmount > 0", async function () {
+            const { campaignId } = await createActiveCampaign();
+            await mockERC20.connect(donor1).approve(crowdfundAddress, smallDonationTokens);
+            await crowdfund.connect(donor1).donate(campaignId, smallDonationTokens);
+            await expect(crowdfund.connect(creatorAcc).cancelCampaign(campaignId))
+                .to.be.revertedWithCustomError(crowdfund, "CampaignHasDonations");
+        });
+
+        it("cancelCampaign can be called in any status if raisedAmount == 0", async function () {
+            const { campaignId, endTime } = await createActiveCampaign();
+            // After endTime, isActuallyFailed would be true but status still Active
+            await time.increaseTo(endTime + 1n);
+            // Should still allow cancel since raisedAmount == 0
+            await expect(crowdfund.connect(creatorAcc).cancelCampaign(campaignId))
+                .to.emit(crowdfund, "CampaignCancelled")
+                .withArgs(campaignId, creatorAcc.address);
+            const camp = await getCampaignState(campaignId);
+            expect(camp.status).to.equal(Status.Cancelled);
+        });
+    });
 });

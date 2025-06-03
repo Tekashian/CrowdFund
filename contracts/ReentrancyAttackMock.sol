@@ -6,7 +6,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /**
  * @title Reentrancy Attack Simulation Contract (for ERC20 Crowdfund)
- * @author [Twoje Imię/Nazwa Firmy/Pseudonim Developera]
+ * @author 
  * @notice This contract is designed to interact with an ERC20-based Crowdfund contract for testing purposes,
  * including simulating conditions for reentrancy attacks.
  * @dev It's crucial to understand that the classic Ether-based reentrancy vector (via `receive()`)

@@ -1,31 +1,31 @@
+// contracts/test/MockERC20.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol"; // Dla funkcji mint dostępnej tylko dla właściciela
 
-// Prosty mockowy kontrakt ERC20 do celów testowych
-contract MockERC20 is ERC20, Ownable {
-    uint8 private immutable _decimals;
+/// @notice Simple ERC20 token for testing with mint functionality.
+contract MockERC20 is ERC20 {
+    address public owner;
 
     constructor(
-        string memory name,
-        string memory symbol,
-        uint8 decimals_,
-        uint256 initialSupplyOwner,
-        address initialOwner
-    ) ERC20(name, symbol) Ownable(initialOwner) {
-        _decimals = decimals_;
-        if (initialSupplyOwner > 0) {
-            _mint(initialOwner, initialSupplyOwner * (10**uint256(decimals_)));
-        }
+        string memory name_,
+        string memory symbol_,
+        uint8 decimals_, 
+        uint256 initialSupply_, 
+        address _owner
+    ) ERC20(name_, symbol_) {
+        owner = _owner;
+        _mint(_owner, initialSupply_ * (10 ** uint256(decimals_)));
     }
 
-    function decimals() public view virtual override returns (uint8) {
-        return _decimals;
+    function decimals() public view override returns (uint8) {
+        return super.decimals();
     }
 
-    function mint(address to, uint256 amount) public onlyOwner {
+    /// @notice Mints new tokens. Only owner can mint.
+    function mint(address to, uint256 amount) external {
+        require(msg.sender == owner, "MockERC20: only owner can mint");
         _mint(to, amount);
     }
 }
